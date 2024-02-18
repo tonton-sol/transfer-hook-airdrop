@@ -4,8 +4,12 @@ use {
     // crate::meta::parse_transfer_hook_account_arg,
     clap::{crate_description, crate_name, crate_version, Arg, Command},
     solana_clap_v3_utils::{
-        input_parsers::{parse_url_or_moniker, pubkey_of_signer},
-        input_validators::{is_valid_pubkey, is_valid_signer, normalize_to_url_if_moniker},
+        input_parsers::{
+            parse_url_or_moniker, pubkey_of_signer, signer::SignerSourceParserBuilder, Amount,
+        },
+        input_validators::{
+            is_amount_or_all, is_valid_pubkey, is_valid_signer, normalize_to_url_if_moniker,
+        },
         keypair::DefaultSigner,
     },
 
@@ -26,10 +30,6 @@ use {
     },
     std::{process::exit, rc::Rc},
 };
-
-fn clap_is_valid_pubkey(arg: &str) -> Result<(), String> {
-    is_valid_pubkey(arg)
-}
 
 // Helper function to calculate the required lamports for rent
 async fn calculate_rent_lamports(
@@ -208,10 +208,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Arg::new("fee_payer")
                 .long("fee-payer")
                 .value_name("KEYPAIR")
-                .validator(|s| is_valid_signer(s))
+                .value_parser(SignerSourceParserBuilder::default().build())
                 .takes_value(true)
                 .global(true)
-                .help("Filepath or URL to a keypair to pay transaction fee [default: client keypair]"),
+                .help(
+                    "Filepath or URL to a keypair to pay transaction fee [default: client keypair]",
+                ),
         )
         .arg(
             Arg::new("verbose")
@@ -232,173 +234,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .help("JSON RPC URL for the cluster [default: value from configuration file]"),
         )
         .subcommand(
-            Command::new("create-extra-metas")
-                .about("Create the extra account metas account for a transfer hook program")
+            Command::new("airdrop")
+                .about("Airdrop a given number of tokens to the provided list of addresses")
                 .arg(
-                    Arg::with_name("program_id")
-                        .validator(clap_is_valid_pubkey)
-                        .value_name("TRANSFER_HOOK_PROGRAM")
+                    Arg::with_name("token")
+                        .validator(|p| is_valid_pubkey(p))
+                        .value_name("TOKEN_MINT_ADDRESS")
                         .takes_value(true)
                         .index(1)
                         .required(true)
-                        .help("The transfer hook program id"),
+                        .help("Token to airdrop"),
                 )
                 .arg(
-                    Arg::with_name("token")
-                        .validator(clap_is_valid_pubkey)
-                        .value_name("TOKEN_MINT_ADDRESS")
+                    Arg::with_name("amount")
+                        .validator(|a| is_amount_or_all(a))
+                        .value_name("TOKEN_AMOUNT")
                         .takes_value(true)
                         .index(2)
                         .required(true)
-                        .help("The token mint address for the transfer hook"),
+                        .help("Amount to send, in tokens; accepts keyword ALL"),
                 )
                 .arg(
-                    Arg::with_name("transfer_hook_accounts")
-                        // .value_parser(parse_transfer_hook_account_arg)
-                        .value_name("TRANSFER_HOOK_ACCOUNTS")
+                    Arg::with_name("recipient_accounts")
+                        .validator(|p| is_valid_pubkey(p))
+                        .value_name("RECIPIENT_ACCOUNTS")
                         .takes_value(true)
                         .multiple(true)
                         .min_values(0)
                         .index(3)
-                        .help(r#"Additional account(s) required for a transfer hook and their respective configurations, whether they are a fixed address or PDA.
-
-Additional accounts with known fixed addresses can be passed at the command line in the format "<PUBKEY>:<ROLE>". The role must be "readonly", "writable". "readonlySigner", or "writableSigner".
-
-Additional acounts requiring seed configurations can be defined in a configuration file using either JSON or YAML. The format is as follows:
-                            
-```json
-{
-    "extraMetas": [
-        {
-            "pubkey": "39UhV...",
-            "role": "readonlySigner"
-        },
-        {
-            "seeds": [
-                {
-                    "literal": {
-                        "bytes": [1, 2, 3, 4, 5, 6]
-                    }
-                },
-                {
-                    "accountKey": {
-                        "index": 0
-                    }
-                }
-            ],
-            "role": "writable"
-        }
-    ]
-}
-```
-
-```yaml
-extraMetas:
-  - pubkey: "39UhV..."
-      role: "readonlySigner"
-  - seeds:
-      - literal:
-          bytes: [1, 2, 3, 4, 5, 6]
-      - accountKey:
-          index: 0
-      role: "writable"
-```
-"#)
+                        .help("Accounts to airdrop to"),
                 )
                 .arg(
-                    Arg::new("mint_authority")
-                        .long("mint-authority")
-                        .value_name("KEYPAIR")
-                        .validator(|s| is_valid_signer(s))
+                    Arg::new("recipients_csv_file")
+                        .short('f')
+                        .long("file")
+                        .value_name("RECIPIENTS_CSV_FILE")
                         .takes_value(true)
                         .global(true)
-                        .help("Filepath or URL to mint-authority keypair [default: client keypair]"),
-                )
+                        .value_parser(parse_url_or_moniker)
+                        .help("CSV file containing a list of recipient accounts"),
+                ),
         )
-        .subcommand(
-            Command::new("update-extra-metas")
-                .about("Update the extra account metas account for a transfer hook program")
-                .arg(
-                    Arg::with_name("program_id")
-                        .validator(clap_is_valid_pubkey)
-                        .value_name("TRANSFER_HOOK_PROGRAM")
-                        .takes_value(true)
-                        .index(1)
-                        .required(true)
-                        .help("The transfer hook program id"),
-                )
-                .arg(
-                    Arg::with_name("token")
-                        .validator(clap_is_valid_pubkey)
-                        .value_name("TOKEN_MINT_ADDRESS")
-                        .takes_value(true)
-                        .index(2)
-                        .required(true)
-                        .help("The token mint address for the transfer hook"),
-                )
-                .arg(
-                    Arg::with_name("transfer_hook_accounts")
-                        // .value_parser(parse_transfer_hook_account_arg)
-                        .value_name("TRANSFER_HOOK_ACCOUNTS")
-                        .takes_value(true)
-                        .multiple(true)
-                        .min_values(0)
-                        .index(3)
-                        .help(r#"Additional account(s) required for a transfer hook and their respective configurations, whether they are a fixed address or PDA.
-
-Additional accounts with known fixed addresses can be passed at the command line in the format "<PUBKEY>:<ROLE>". The role must be "readonly", "writable". "readonlySigner", or "writableSigner".
-
-Additional acounts requiring seed configurations can be defined in a configuration file using either JSON or YAML. The format is as follows:
-                            
-```json
-{
-    "extraMetas": [
-        {
-            "pubkey": "39UhV...",
-            "role": "readonlySigner"
-        },
-        {
-            "seeds": [
-                {
-                    "literal": {
-                        "bytes": [1, 2, 3, 4, 5, 6]
-                    }
-                },
-                {
-                    "accountKey": {
-                        "index": 0
-                    }
-                }
-            ],
-            "role": "writable"
-        }
-    ]
-}
-```
-
-```yaml
-extraMetas:
-  - pubkey: "39UhV..."
-      role: "readonlySigner"
-  - seeds:
-      - literal:
-          bytes: [1, 2, 3, 4, 5, 6]
-      - accountKey:
-          index: 0
-      role: "writable"
-```
-"#)
-                )
-                .arg(
-                    Arg::new("mint_authority")
-                        .long("mint-authority")
-                        .value_name("KEYPAIR")
-                        .validator(|s| is_valid_signer(s))
-                        .takes_value(true)
-                        .global(true)
-                        .help("Filepath or URL to mint-authority keypair [default: client keypair]"),
-                )
-        ).get_matches();
+        .get_matches();
 
     let (command, matches) = app_matches.subcommand().unwrap();
     let mut wallet_manager: Option<Rc<RemoteWalletManager>> = None;
@@ -445,6 +322,17 @@ extraMetas:
         RpcClient::new_with_commitment(config.json_rpc_url.clone(), config.commitment_config);
 
     match (command, matches) {
+        ("airdrop", arg_matches) => {
+            let token = pubkey_of_signer(arg_matches, "token", &mut wallet_manager)
+                .unwrap()
+                .unwrap();
+            let amount = match arg_matches.value_of("amount").unwrap() {
+                "ALL" => None,
+                amount => Some(amount.parse::<f64>().unwrap()),
+            };
+            println!("{:?}", token);
+            println!("{:?}", amount.unwrap());
+        }
         ("create-extra-metas", arg_matches) => {
             let program_id = pubkey_of_signer(arg_matches, "program_id", &mut wallet_manager)
                 .unwrap()
