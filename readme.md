@@ -60,6 +60,7 @@ thook airdrop --token_address <TOKEN_ADDRESS> --recipients_csv_path <RECIPIENTS_
 
 ## Example
 
+```bash
 thook --rpc https://api.mainnet-beta.solana.com --keypair /path/to/keypair.json airdrop --token_address So11111111111111111111111111111111111111112 --recipients_csv_path /path/to/recipients.csv --amount 100
 ```
 
