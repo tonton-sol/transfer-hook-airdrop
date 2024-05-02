@@ -108,6 +108,8 @@ fn extract_column_from_csv(
 async fn load_config(args: &Args) -> Result<solana_cli_config::Config, Box<dyn Error>> {
     if let Some(config_file) = &args.config_file {
         Ok(solana_cli_config::Config::load(config_file)?)
+    } else if let Some(config_file) = &*solana_cli_config::CONFIG_FILE {
+        Ok(solana_cli_config::Config::load(config_file).unwrap_or_default())
     } else {
         Ok(solana_cli_config::Config::default())
     }
