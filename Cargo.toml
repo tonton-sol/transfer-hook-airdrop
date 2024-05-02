@@ -1,16 +1,10 @@
 [package]
-authors = [""]
+authors = ["tonton-sol"]
 description = "Command-Line Tool for Airdropping Tokens with the Transfer-Hook Extension."
 edition = "2021"
-homepage = "https://spl.solana.com/token"
-license = "Apache-2.0"
 name = "transfer-hook-airdrop"
 repository = ""
 version = "0.1.0"
-
-[[bin]]
-name = "thook"
-path = "src/main.rs"
 
 [dependencies]
 clap = { version = "4.5.4", features = ["derive"] }
@@ -42,5 +36,5 @@ spl-token-2022 = { version = "2.0.1",  features = ["no-entrypoint"] }
 spl-token-client = { version = "0.8"}
 
 [[bin]]
-name = "transfer-hook-airdrop"
+name = "thook"
 path = "src/main.rs"
