@@ -1,517 +1,242 @@
-// pub mod meta;
-
 use {
-    // crate::meta::parse_transfer_hook_account_arg,
-    clap::{crate_description, crate_name, crate_version, Arg, Command},
-    solana_clap_v3_utils::{
-        input_parsers::{
-            parse_url_or_moniker, pubkey_of_signer, signer::SignerSourceParserBuilder, Amount,
-        },
-        input_validators::{
-            is_amount_or_all, is_valid_pubkey, is_valid_signer, normalize_to_url_if_moniker,
-        },
-        keypair::DefaultSigner,
-    },
-
-    solana_client::nonblocking::rpc_client::RpcClient,
-    solana_remote_wallet::remote_wallet::RemoteWalletManager,
+    clap::{Parser, Subcommand},
+    csv::Reader,
+    futures_util::TryFutureExt,
+    solana_client::{nonblocking::rpc_client::RpcClient, rpc_config::RpcSendTransactionConfig},
     solana_sdk::{
-        commitment_config::CommitmentConfig,
+        commitment_config::{CommitmentConfig, CommitmentLevel},
         instruction::Instruction,
+        message::Message,
         pubkey::Pubkey,
-        signature::{Signature, Signer},
-        system_instruction, system_program,
+        signature::read_keypair_file,
+        signer::Signer,
         transaction::Transaction,
     },
-    spl_tlv_account_resolution::{account::ExtraAccountMeta, state::ExtraAccountMetaList},
-    spl_transfer_hook_interface::{
-        get_extra_account_metas_address,
-        instruction::{initialize_extra_account_meta_list, update_extra_account_meta_list},
+    spl_associated_token_account::{
+        get_associated_token_address_with_program_id,
+        instruction::create_associated_token_account_idempotent,
     },
-    std::{process::exit, rc::Rc},
+    spl_token_2022::offchain,
+    spl_token_client::client::{ProgramClient, ProgramRpcClient, ProgramRpcClientSendTransaction},
+    std::{error::Error, str::FromStr, sync::Arc},
 };
 
-// Helper function to calculate the required lamports for rent
-async fn calculate_rent_lamports(
-    rpc_client: &RpcClient,
-    account_address: &Pubkey,
-    account_size: usize,
-) -> Result<u64, Box<dyn std::error::Error>> {
-    let required_lamports = rpc_client
-        .get_minimum_balance_for_rent_exemption(account_size)
-        .await
-        .map_err(|err| format!("error: unable to fetch rent-exemption: {err}"))?;
-    let account_info = rpc_client.get_account(account_address).await;
-    let current_lamports = account_info.map(|a| a.lamports).unwrap_or(0);
-    Ok(required_lamports.saturating_sub(current_lamports))
+#[derive(Parser)]
+#[command(version, about, long_about = None)]
+struct Args {
+    #[arg(
+        long,
+        value_name = "NETWORK_URL",
+        help = "Network address of your RPC provider",
+        global = true
+    )]
+    rpc: Option<String>,
+
+    #[clap(
+        global = true,
+        short = 'C',
+        long = "config",
+        id = "PATH",
+        help = "Filepath to config file."
+    )]
+    pub config_file: Option<String>,
+
+    #[arg(
+        long,
+        value_name = "KEYPAIR_FILEPATH",
+        help = "Filepath to keypair to use",
+        global = true
+    )]
+    keypair: Option<String>,
+
+    #[arg(
+        long,
+        value_name = "MICROLAMPORTS",
+        help = "Number of microlamports to pay as priority fee per transaction",
+        default_value = "0",
+        global = true
+    )]
+    priority_fee: u64,
+
+    #[command(subcommand)]
+    command: Commands,
 }
 
-async fn build_transaction_with_rent_transfer(
-    rpc_client: &RpcClient,
-    payer: &dyn Signer,
-    extra_account_metas_address: &Pubkey,
-    extra_account_metas: &Vec<ExtraAccountMeta>,
-    instruction: Instruction,
-) -> Result<Transaction, Box<dyn std::error::Error>> {
-    let account_size = ExtraAccountMetaList::size_of(extra_account_metas.len())?;
-    let transfer_lamports =
-        calculate_rent_lamports(rpc_client, extra_account_metas_address, account_size).await?;
-
-    let mut instructions = vec![];
-    if transfer_lamports > 0 {
-        instructions.push(system_instruction::transfer(
-            &payer.pubkey(),
-            extra_account_metas_address,
-            transfer_lamports,
-        ));
-    }
-
-    instructions.push(instruction);
-
-    let transaction = Transaction::new_with_payer(&instructions, Some(&payer.pubkey()));
-
-    Ok(transaction)
+#[derive(Subcommand, Debug)]
+enum Commands {
+    #[command(about = "Airdrop tokens to the provided list of addresses.")]
+    Airdrop(AirdropArgs),
 }
 
-async fn sign_and_send_transaction(
-    transaction: &mut Transaction,
-    rpc_client: &RpcClient,
-    payer: &dyn Signer,
-    mint_authority: &dyn Signer,
-) -> Result<Signature, Box<dyn std::error::Error>> {
-    let mut signers = vec![payer];
-    if payer.pubkey() != mint_authority.pubkey() {
-        signers.push(mint_authority);
-    }
+#[derive(Parser, Debug)]
+struct AirdropArgs {
+    #[arg(
+        value_name = "TOKEN_ADDRESS",
+        help = "The address of the token to airdrop"
+    )]
+    pub token_address: String,
 
-    let blockhash = rpc_client
-        .get_latest_blockhash()
-        .await
-        .map_err(|err| format!("error: unable to get latest blockhash: {err}"))?;
+    #[arg(
+        value_name = "RECIPIENTS_CSV_PATH",
+        help = "The address CSV of the airdrop recipients"
+    )]
+    pub recipients_csv_path: String,
 
-    transaction
-        .try_sign(&signers, blockhash)
-        .map_err(|err| format!("error: failed to sign transaction: {err}"))?;
-
-    rpc_client
-        .send_and_confirm_transaction_with_spinner(transaction)
-        .await
-        .map_err(|err| format!("error: send transaction: {err}").into())
+    #[arg(
+        value_name = "AMOUNT",
+        help = "The amount of the token to airdrop per address"
+    )]
+    pub amount: u64,
 }
+fn extract_column_from_csv(
+    file_path: &str,
+    column_index: usize,
+) -> Result<Vec<Pubkey>, Box<dyn std::error::Error>> {
+    let mut rdr = Reader::from_path(file_path)?;
+    let mut column_values: Vec<Pubkey> = Vec::new();
 
-struct Config {
-    commitment_config: CommitmentConfig,
-    default_signer: Box<dyn Signer>,
-    json_rpc_url: String,
-    verbose: bool,
-}
-
-async fn process_create_extra_account_metas(
-    rpc_client: &RpcClient,
-    program_id: &Pubkey,
-    token: &Pubkey,
-    extra_account_metas: Vec<ExtraAccountMeta>,
-    mint_authority: &dyn Signer,
-    payer: &dyn Signer,
-) -> Result<Signature, Box<dyn std::error::Error>> {
-    let extra_account_metas_address = get_extra_account_metas_address(token, program_id);
-
-    // Check if the extra meta account has already been initialized
-    let extra_account_metas_account = rpc_client.get_account(&extra_account_metas_address).await;
-    if let Ok(account) = &extra_account_metas_account {
-        if account.owner != system_program::id() {
-            return Err(format!("error: extra account metas for mint {token} and program {program_id} already exists").into());
+    for result in rdr.records() {
+        let record = result?;
+        if let Some(value) = record.get(column_index) {
+            column_values.push(Pubkey::from_str(&value.to_string()).unwrap());
         }
     }
 
-    let instruction = initialize_extra_account_meta_list(
-        program_id,
-        &extra_account_metas_address,
-        token,
-        &mint_authority.pubkey(),
-        &extra_account_metas,
-    );
-
-    let mut transaction = build_transaction_with_rent_transfer(
-        rpc_client,
-        payer,
-        &extra_account_metas_address,
-        &extra_account_metas,
-        instruction,
-    )
-    .await?;
-
-    sign_and_send_transaction(&mut transaction, rpc_client, payer, mint_authority).await
+    Ok(column_values)
 }
 
-async fn process_update_extra_account_metas(
-    rpc_client: &RpcClient,
-    program_id: &Pubkey,
-    token: &Pubkey,
-    extra_account_metas: Vec<ExtraAccountMeta>,
-    mint_authority: &dyn Signer,
-    payer: &dyn Signer,
-) -> Result<Signature, Box<dyn std::error::Error>> {
-    let extra_account_metas_address = get_extra_account_metas_address(token, program_id);
-
-    // Check if the extra meta account has been initialized first
-    let extra_account_metas_account = rpc_client.get_account(&extra_account_metas_address).await;
-    if extra_account_metas_account.is_err() {
-        return Err(format!(
-            "error: extra account metas for mint {token} and program {program_id} does not exist"
-        )
-        .into());
-    }
-
-    let instruction = update_extra_account_meta_list(
-        program_id,
-        &extra_account_metas_address,
-        token,
-        &mint_authority.pubkey(),
-        &extra_account_metas,
-    );
-
-    let mut transaction = build_transaction_with_rent_transfer(
-        rpc_client,
-        payer,
-        &extra_account_metas_address,
-        &extra_account_metas,
-        instruction,
-    )
-    .await?;
-
-    sign_and_send_transaction(&mut transaction, rpc_client, payer, mint_authority).await
-}
-
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let app_matches = Command::new(crate_name!())
-        .about(crate_description!())
-        .version(crate_version!())
-        .subcommand_required(true)
-        .arg_required_else_help(true)
-        .arg({
-            let arg = Arg::new("config_file")
-                .short('C')
-                .long("config")
-                .value_name("PATH")
-                .takes_value(true)
-                .global(true)
-                .help("Configuration file to use");
-            if let Some(ref config_file) = *solana_cli_config::CONFIG_FILE {
-                arg.default_value(config_file)
-            } else {
-                arg
-            }
-        })
-        .arg(
-            Arg::new("fee_payer")
-                .long("fee-payer")
-                .value_name("KEYPAIR")
-                .value_parser(SignerSourceParserBuilder::default().build())
-                .takes_value(true)
-                .global(true)
-                .help(
-                    "Filepath or URL to a keypair to pay transaction fee [default: client keypair]",
-                ),
-        )
-        .arg(
-            Arg::new("verbose")
-                .long("verbose")
-                .short('v')
-                .takes_value(false)
-                .global(true)
-                .help("Show additional information"),
-        )
-        .arg(
-            Arg::new("json_rpc_url")
-                .short('u')
-                .long("url")
-                .value_name("URL")
-                .takes_value(true)
-                .global(true)
-                .value_parser(parse_url_or_moniker)
-                .help("JSON RPC URL for the cluster [default: value from configuration file]"),
-        )
-        .subcommand(
-            Command::new("airdrop")
-                .about("Airdrop a given number of tokens to the provided list of addresses")
-                .arg(
-                    Arg::with_name("token")
-                        .validator(|p| is_valid_pubkey(p))
-                        .value_name("TOKEN_MINT_ADDRESS")
-                        .takes_value(true)
-                        .index(1)
-                        .required(true)
-                        .help("Token to airdrop"),
-                )
-                .arg(
-                    Arg::with_name("amount")
-                        .validator(|a| is_amount_or_all(a))
-                        .value_name("TOKEN_AMOUNT")
-                        .takes_value(true)
-                        .index(2)
-                        .required(true)
-                        .help("Amount to send, in tokens; accepts keyword ALL"),
-                )
-                .arg(
-                    Arg::with_name("recipient_accounts")
-                        .validator(|p| is_valid_pubkey(p))
-                        .value_name("RECIPIENT_ACCOUNTS")
-                        .takes_value(true)
-                        .multiple(true)
-                        .min_values(0)
-                        .index(3)
-                        .help("Accounts to airdrop to"),
-                )
-                .arg(
-                    Arg::new("recipients_csv_file")
-                        .short('f')
-                        .long("file")
-                        .value_name("RECIPIENTS_CSV_FILE")
-                        .takes_value(true)
-                        .global(true)
-                        .value_parser(parse_url_or_moniker)
-                        .help("CSV file containing a list of recipient accounts"),
-                ),
-        )
-        .get_matches();
-
-    let (command, matches) = app_matches.subcommand().unwrap();
-    let mut wallet_manager: Option<Rc<RemoteWalletManager>> = None;
-
-    let cli_config = if let Some(config_file) = matches.value_of("config_file") {
-        solana_cli_config::Config::load(config_file).unwrap_or_default()
+async fn load_config(args: &Args) -> Result<solana_cli_config::Config, Box<dyn Error>> {
+    if let Some(config_file) = &args.config_file {
+        Ok(solana_cli_config::Config::load(config_file)?)
     } else {
-        solana_cli_config::Config::default()
-    };
-
-    let config = {
-        let default_signer = DefaultSigner::new(
-            "fee_payer",
-            matches
-                .value_of("fee_payer")
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| cli_config.keypair_path.clone()),
-        );
-
-        let json_rpc_url = normalize_to_url_if_moniker(
-            matches
-                .value_of("json_rpc_url")
-                .unwrap_or(&cli_config.json_rpc_url),
-        );
-
-        Config {
-            commitment_config: CommitmentConfig::confirmed(),
-            default_signer: default_signer
-                .signer_from_path(matches, &mut wallet_manager)
-                .unwrap_or_else(|err| {
-                    eprintln!("error: {err}");
-                    exit(1);
-                }),
-            json_rpc_url,
-            verbose: matches.is_present("verbose"),
-        }
-    };
-    solana_logger::setup_with_default("solana=info");
-
-    if config.verbose {
-        println!("JSON RPC URL: {}", config.json_rpc_url);
+        Ok(solana_cli_config::Config::default())
     }
-    let rpc_client =
-        RpcClient::new_with_commitment(config.json_rpc_url.clone(), config.commitment_config);
-
-    match (command, matches) {
-        ("airdrop", arg_matches) => {
-            let token = pubkey_of_signer(arg_matches, "token", &mut wallet_manager)
-                .unwrap()
-                .unwrap();
-            let amount = match arg_matches.value_of("amount").unwrap() {
-                "ALL" => None,
-                amount => Some(amount.parse::<f64>().unwrap()),
-            };
-            println!("{:?}", token);
-            println!("{:?}", amount.unwrap());
-        }
-        ("create-extra-metas", arg_matches) => {
-            let program_id = pubkey_of_signer(arg_matches, "program_id", &mut wallet_manager)
-                .unwrap()
-                .unwrap();
-            let token = pubkey_of_signer(arg_matches, "token", &mut wallet_manager)
-                .unwrap()
-                .unwrap();
-            let transfer_hook_accounts = arg_matches
-                .get_many::<Vec<ExtraAccountMeta>>("transfer_hook_accounts")
-                .unwrap_or_default()
-                .flatten()
-                .cloned()
-                .collect();
-            let mint_authority = DefaultSigner::new(
-                "mint_authority",
-                matches
-                    .value_of("mint_authority")
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| cli_config.keypair_path.clone()),
-            )
-            .signer_from_path(matches, &mut wallet_manager)
-            .unwrap_or_else(|err| {
-                eprintln!("error: {err}");
-                exit(1);
-            });
-            let signature = process_create_extra_account_metas(
-                &rpc_client,
-                &program_id,
-                &token,
-                transfer_hook_accounts,
-                mint_authority.as_ref(),
-                config.default_signer.as_ref(),
-            )
-            .await
-            .unwrap_or_else(|err| {
-                eprintln!("error: send transaction: {err}");
-                exit(1);
-            });
-            println!("Signature: {signature}");
-        }
-        ("update-extra-metas", arg_matches) => {
-            let program_id = pubkey_of_signer(arg_matches, "program_id", &mut wallet_manager)
-                .unwrap()
-                .unwrap();
-            let token = pubkey_of_signer(arg_matches, "token", &mut wallet_manager)
-                .unwrap()
-                .unwrap();
-            let transfer_hook_accounts = arg_matches
-                .get_many::<Vec<ExtraAccountMeta>>("transfer_hook_accounts")
-                .unwrap_or_default()
-                .flatten()
-                .cloned()
-                .collect();
-            let mint_authority = DefaultSigner::new(
-                "mint_authority",
-                matches
-                    .value_of("mint_authority")
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| cli_config.keypair_path.clone()),
-            )
-            .signer_from_path(matches, &mut wallet_manager)
-            .unwrap_or_else(|err| {
-                eprintln!("error: {err}");
-                exit(1);
-            });
-            let signature = process_update_extra_account_metas(
-                &rpc_client,
-                &program_id,
-                &token,
-                transfer_hook_accounts,
-                mint_authority.as_ref(),
-                config.default_signer.as_ref(),
-            )
-            .await
-            .unwrap_or_else(|err| {
-                eprintln!("error: send transaction: {err}");
-                exit(1);
-            });
-            println!("Signature: {signature}");
-        }
-        _ => unreachable!(),
-    };
-
-    Ok(())
 }
 
-#[cfg(test)]
-mod test {
-    use {
-        super::*,
-        solana_sdk::{bpf_loader_upgradeable, instruction::AccountMeta, signer::keypair::Keypair},
-        solana_test_validator::{TestValidator, TestValidatorGenesis, UpgradeableProgramInfo},
-        spl_token_client::{
-            client::{
-                ProgramClient, ProgramRpcClient, ProgramRpcClientSendTransaction, SendTransaction,
-                SimulateTransaction,
-            },
-            token::Token,
-        },
-        std::{path::PathBuf, sync::Arc},
-    };
+async fn create_airdrop_tx(
+    args: AirdropArgs,
+    rpc_client: Arc<RpcClient>,
+    source_keypair: Arc<dyn Signer>,
+) -> Result<Transaction, Box<dyn Error>> {
+    let recipients_pubkeys = extract_column_from_csv(&args.recipients_csv_path, 0).unwrap();
+    let source_pubkey = &source_keypair.pubkey();
+    let token_pubkey = Pubkey::from_str(&args.token_address).unwrap();
+    let token_amount = args.amount;
 
-    async fn new_validator_for_test(program_id: Pubkey) -> (TestValidator, Keypair) {
-        solana_logger::setup();
-        let mut test_validator_genesis = TestValidatorGenesis::default();
-        test_validator_genesis.add_upgradeable_programs_with_path(&[UpgradeableProgramInfo {
-            program_id,
-            loader: bpf_loader_upgradeable::id(),
-            program_path: PathBuf::from("../../../target/deploy/spl_transfer_hook_example.so"),
-            upgrade_authority: Pubkey::new_unique(),
-        }]);
-        test_validator_genesis.start_async().await
-    }
+    let amount = spl_token_2022::ui_amount_to_amount(token_amount as f64, 9);
 
-    async fn setup_mint<T: SendTransaction + SimulateTransaction>(
-        program_id: &Pubkey,
-        mint_authority: &Pubkey,
-        decimals: u8,
-        payer: Arc<dyn Signer>,
-        client: Arc<dyn ProgramClient<T>>,
-    ) -> Token<T> {
-        let mint_account = Keypair::new();
-        let token = Token::new(
-            client,
-            program_id,
-            &mint_account.pubkey(),
-            Some(decimals),
-            payer,
+    println!("Source: {:?}", source_keypair.pubkey());
+    println!("Token: {:?}", token_pubkey);
+    println!("Recipients: {:?}", recipients_pubkeys);
+    println!("Amount: {}", token_amount);
+
+    let program_client: Arc<dyn ProgramClient<ProgramRpcClientSendTransaction>> = Arc::new(
+        ProgramRpcClient::new(rpc_client, ProgramRpcClientSendTransaction),
+    );
+
+    let sender = get_associated_token_address_with_program_id(
+        &source_pubkey,
+        &token_pubkey,
+        &spl_token_2022::id(),
+    );
+    println!("Sender ATA: {}", sender);
+
+    let mut instructions: Vec<Instruction> = Vec::new();
+
+    for recipient in recipients_pubkeys.iter() {
+        let destination = get_associated_token_address_with_program_id(
+            &recipient,
+            &token_pubkey,
+            &spl_token_2022::id(),
         );
-        token
-            .create_mint(mint_authority, None, vec![], &[&mint_account])
-            .await
-            .unwrap();
-        token
-    }
+        println!("Destination ATA: {}", destination);
 
-    #[tokio::test]
-    async fn test_create() {
-        let program_id = Pubkey::new_unique();
-
-        let (test_validator, payer) = new_validator_for_test(program_id).await;
-        let payer: Arc<dyn Signer> = Arc::new(payer);
-        let rpc_client = Arc::new(test_validator.get_async_rpc_client());
-        let client = Arc::new(ProgramRpcClient::new(
-            rpc_client.clone(),
-            ProgramRpcClientSendTransaction,
+        instructions.push(create_associated_token_account_idempotent(
+            &source_pubkey,
+            recipient,
+            &token_pubkey,
+            &spl_token_2022::id(),
         ));
 
-        let mint_authority = Keypair::new();
-        let decimals = 2;
+        let fetch_account_data_fn = |address| {
+            program_client
+                .get_account(address)
+                .map_ok(|opt| opt.map(|acc| acc.data))
+        };
 
-        let token = setup_mint(
+        let instruction = offchain::create_transfer_checked_instruction_with_extra_metas(
             &spl_token_2022::id(),
-            &mint_authority.pubkey(),
-            decimals,
-            payer.clone(),
-            client.clone(),
-        )
-        .await;
-
-        let required_address = Pubkey::new_unique();
-        let accounts = vec![AccountMeta::new_readonly(required_address, false)];
-        process_create_extra_account_metas(
-            &rpc_client,
-            &program_id,
-            token.get_address(),
-            accounts.iter().map(|a| a.into()).collect(),
-            &mint_authority,
-            payer.as_ref(),
+            &sender,
+            &token_pubkey,
+            &destination,
+            &source_keypair.pubkey(),
+            &[],
+            amount,
+            9,
+            fetch_account_data_fn,
         )
         .await
         .unwrap();
 
-        let extra_account_metas_address =
-            get_extra_account_metas_address(token.get_address(), &program_id);
-        let account = rpc_client
-            .get_account(&extra_account_metas_address)
-            .await
-            .unwrap();
-        assert_eq!(account.owner, program_id);
+        instructions.push(instruction)
     }
+
+    let blockhash = program_client.get_latest_blockhash().await.unwrap();
+
+    let message =
+        Message::new_with_blockhash(&instructions, Some(&source_keypair.pubkey()), &blockhash);
+    let mut transaction = Transaction::new_unsigned(message);
+
+    // let signers = [&source_keypair];
+    let signers: Vec<&dyn Signer> = vec![source_keypair.as_ref()];
+
+    transaction.sign(&signers, blockhash);
+
+    Ok(transaction)
+}
+
+async fn execute_airdrop(
+    transaction: Transaction,
+    rpc_client: Arc<RpcClient>,
+) -> Result<(), Box<dyn Error>> {
+    let config = RpcSendTransactionConfig {
+        skip_preflight: true,
+        preflight_commitment: Some(CommitmentLevel::Processed),
+        ..Default::default()
+    };
+
+    rpc_client
+        .send_and_confirm_transaction_with_spinner_and_config(
+            &transaction,
+            CommitmentConfig::processed(),
+            config,
+        )
+        .await
+        .unwrap();
+    Ok(())
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let args = Args::parse();
+
+    let cli_config = load_config(&args).await?;
+    let source_keypair =
+        Arc::new(read_keypair_file(args.keypair.unwrap_or(cli_config.keypair_path)).unwrap());
+    let cluster = args.rpc.unwrap_or(cli_config.json_rpc_url);
+    let rpc_client = Arc::new(RpcClient::new_with_commitment(
+        cluster,
+        CommitmentConfig::confirmed(),
+    ));
+
+    match args.command {
+        Commands::Airdrop(args) => {
+            let tx = create_airdrop_tx(args, rpc_client.clone(), source_keypair)
+                .await
+                .unwrap();
+            execute_airdrop(tx, rpc_client.clone()).await?;
+        }
+    }
+
+    Ok(())
 }
