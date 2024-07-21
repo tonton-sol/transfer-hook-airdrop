@@ -198,6 +198,8 @@ async fn process_airdrop(
             &spl_token_2022::id(),
         );
 
+        let token_amount = spl_token_2022::ui_amount_to_amount(amount as f64, 9);
+
         if let Ok(Some(_ata)) = program_client.get_account(destination).await {
         } else {
             recipient_instructions.push(create_associated_token_account_idempotent(
