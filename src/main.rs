@@ -119,6 +119,7 @@ fn write_remaining_csv(
     file_path: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut wtr = Writer::from_path(file_path)?;
+    wtr.write_record(&["pubkey", "amount"])?;
     for (pubkey, amount) in recipients {
         wtr.write_record(&[pubkey, amount.to_string()])?;
     }
