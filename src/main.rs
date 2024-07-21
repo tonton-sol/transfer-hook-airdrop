@@ -1,10 +1,9 @@
 use {
     clap::{Parser, Subcommand},
-    csv::Reader,
+    csv::{Reader, Writer},
     futures_util::TryFutureExt,
     solana_client::{nonblocking::rpc_client::RpcClient, rpc_config::RpcSendTransactionConfig},
     solana_sdk::{
-        address_lookup_table::program,
         commitment_config::{CommitmentConfig, CommitmentLevel},
         compute_budget::ComputeBudgetInstruction,
         instruction::Instruction,
@@ -23,7 +22,10 @@ use {
     std::{error::Error, str::FromStr, sync::Arc},
 };
 
-pub const CU_LIMIT: u32 = 1000000;
+const CU_LIMIT: u32 = 1000000;
+const REMAINING_CSV_FILE: &str = "remaining_recipients.csv";
+const MAX_RETRIES: usize = 1;
+const MAX_TRANSFERS_PER_TX: usize = 4;
 
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
@@ -78,10 +80,12 @@ struct AirdropArgs {
     pub recipients_csv_path: String,
 
     #[arg(
+        long,
         value_name = "AMOUNT",
-        help = "The total amount of the token to airdrop"
+        help = "The amount of the token to airdrop to each recipient",
+        global = false
     )]
-    pub amount: u64,
+    pub amount: Option<u64>,
 
     #[arg(
         long,
@@ -92,21 +96,34 @@ struct AirdropArgs {
     )]
     priority_fee: Option<u64>,
 }
+
 fn extract_column_from_csv(
     file_path: &str,
     column_index: usize,
-) -> Result<Vec<Pubkey>, Box<dyn std::error::Error>> {
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
     let mut rdr = Reader::from_path(file_path)?;
-    let mut column_values: Vec<Pubkey> = Vec::new();
+    let mut column_values: Vec<String> = Vec::new();
 
     for result in rdr.records() {
         let record = result?;
         if let Some(value) = record.get(column_index) {
-            column_values.push(Pubkey::from_str(&value.to_string()).unwrap());
+            column_values.push(value.to_string());
         }
     }
 
     Ok(column_values)
+}
+
+fn write_remaining_csv(
+    recipients: Vec<(String, u64)>,
+    file_path: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut wtr = Writer::from_path(file_path)?;
+    for (pubkey, amount) in recipients {
+        wtr.write_record(&[pubkey, amount.to_string()])?;
+    }
+    wtr.flush()?;
+    Ok(())
 }
 
 async fn load_config(args: &Args) -> Result<solana_cli_config::Config, Box<dyn Error>> {
@@ -119,30 +136,38 @@ async fn load_config(args: &Args) -> Result<solana_cli_config::Config, Box<dyn E
     }
 }
 
-const MAX_INSTRUCTIONS_PER_TX: usize = 4;
-
-async fn create_airdrop_tx(
-    args: AirdropArgs,
+async fn process_airdrop(
+    args: &AirdropArgs,
     rpc_client: Arc<RpcClient>,
     source_keypair: Arc<dyn Signer>,
-) -> Result<Vec<Transaction>, Box<dyn Error>> {
-    let recipients_pubkeys = extract_column_from_csv(&args.recipients_csv_path, 0).unwrap();
+) -> Result<(), Box<dyn Error>> {
+    let recipient_pubkeys: Vec<Pubkey> = extract_column_from_csv(&args.recipients_csv_path, 0)?
+        .iter()
+        .map(|s| Pubkey::from_str(s).unwrap())
+        .collect();
+
+    let recipient_amounts = if let Some(amount) = args.amount {
+        vec![amount; recipient_pubkeys.len()]
+    } else {
+        extract_column_from_csv(&args.recipients_csv_path, 1)?
+            .iter()
+            .map(|s| s.parse::<u64>().unwrap())
+            .collect()
+    };
+
+    let total_tokens: u64 = recipient_amounts.iter().sum();
+
     let source_pubkey = &source_keypair.pubkey();
     let token_pubkey = Pubkey::from_str(&args.token_address).unwrap();
-    let token_amount = args.amount;
 
-    let amount = spl_token_2022::ui_amount_to_amount(token_amount as f64, 9);
-
-    let mut transactions: Vec<Transaction> = Vec::new();
-    let mut instructions: Vec<Instruction> = Vec::new();
-
-    println!("Source: {:?}", source_keypair.pubkey());
-    println!("Token: {:?}", token_pubkey);
-    println!("Recipients: {:?}", recipients_pubkeys);
-    println!("Amount: {}", token_amount);
+    println!("Airdropping {} tokens", total_tokens);
+    println!("  Sender: {:?}", source_keypair.pubkey());
+    println!("  Token: {:?}", token_pubkey);
+    println!("  Recipients file: {}", &args.recipients_csv_path);
+    println!("");
 
     let program_client: Arc<dyn ProgramClient<ProgramRpcClientSendTransaction>> = Arc::new(
-        ProgramRpcClient::new(rpc_client, ProgramRpcClientSendTransaction),
+        ProgramRpcClient::new(rpc_client.clone(), ProgramRpcClientSendTransaction),
     );
 
     let sender = get_associated_token_address_with_program_id(
@@ -150,13 +175,21 @@ async fn create_airdrop_tx(
         &token_pubkey,
         &spl_token_2022::id(),
     );
-    println!("Sender ATA: {}", sender);
 
     let cu_limit_ix = ComputeBudgetInstruction::set_compute_unit_limit(CU_LIMIT);
     let cu_price_ix =
         ComputeBudgetInstruction::set_compute_unit_price(args.priority_fee.unwrap_or_default());
 
-    for recipient in recipients_pubkeys.iter() {
+    let mut instructions: Vec<Instruction> = Vec::new();
+    let mut transaction_count = 0;
+    let mut transfer_count = 0;
+    let mut remaining_recipients = vec![];
+
+    for (_i, (recipient, &amount)) in recipient_pubkeys
+        .iter()
+        .zip(recipient_amounts.iter())
+        .enumerate()
+    {
         let mut recipient_instructions: Vec<Instruction> = Vec::new();
 
         let destination = get_associated_token_address_with_program_id(
@@ -164,7 +197,6 @@ async fn create_airdrop_tx(
             &token_pubkey,
             &spl_token_2022::id(),
         );
-        println!("Destination ATA: {}", destination);
 
         if let Ok(Some(_ata)) = program_client.get_account(destination).await {
         } else {
@@ -198,7 +230,17 @@ async fn create_airdrop_tx(
 
         recipient_instructions.push(instruction);
 
-        if instructions.len() + recipient_instructions.len() + 1 > MAX_INSTRUCTIONS_PER_TX {
+        // if instructions.len() + recipient_instructions.len() + 1 >
+        // MAX_INSTRUCTIONS_PER_TX {
+        if transfer_count >= MAX_TRANSFERS_PER_TX {
+            transfer_count = 0;
+            transaction_count += 1;
+            println!(
+                "Packing transaction {}/{} 📦",
+                transaction_count,
+                (recipient_pubkeys.len() + MAX_TRANSFERS_PER_TX - 1) / MAX_TRANSFERS_PER_TX
+            );
+
             let mut tx_instructions = vec![cu_price_ix.clone(), cu_limit_ix.clone()];
             tx_instructions.append(&mut instructions);
 
@@ -213,14 +255,49 @@ async fn create_airdrop_tx(
             let signers: Vec<&dyn Signer> = vec![source_keypair.as_ref()];
             transaction.sign(&signers, blockhash);
 
-            transactions.push(transaction);
+            if let Err(e) = send_transaction_with_retries(
+                &mut transaction,
+                rpc_client.clone(),
+                &program_client,
+                &source_keypair,
+            )
+            .await
+            {
+                println!(
+                    "Failed to send transaction {}/{} ❌",
+                    transaction_count,
+                    (recipient_pubkeys.len() + MAX_TRANSFERS_PER_TX - 1) / MAX_TRANSFERS_PER_TX
+                );
+                println!("Writing remaining recipients to CSV 📝");
+                remaining_recipients.extend(
+                    recipient_pubkeys
+                        .iter()
+                        .skip((transaction_count - 1) * MAX_TRANSFERS_PER_TX)
+                        .zip(
+                            recipient_amounts
+                                .iter()
+                                .skip((transaction_count - 1) * MAX_TRANSFERS_PER_TX),
+                        )
+                        .map(|(pk, &amt)| (pk.to_string(), amt)),
+                );
+                write_remaining_csv(remaining_recipients, REMAINING_CSV_FILE)?;
+                return Err(e);
+            }
             instructions.clear();
         }
 
         instructions.extend(recipient_instructions);
+        transfer_count += 1;
     }
 
     if !instructions.is_empty() {
+        transaction_count += 1;
+        println!(
+            "Packing transaction {}/{} 📦",
+            transaction_count,
+            (recipient_pubkeys.len() + MAX_TRANSFERS_PER_TX - 1) / MAX_TRANSFERS_PER_TX
+        );
+
         let mut tx_instructions = vec![cu_price_ix.clone(), cu_limit_ix.clone()];
         tx_instructions.append(&mut instructions);
 
@@ -235,37 +312,92 @@ async fn create_airdrop_tx(
         let signers: Vec<&dyn Signer> = vec![source_keypair.as_ref()];
         transaction.sign(&signers, blockhash);
 
-        transactions.push(transaction);
+        if let Err(e) = send_transaction_with_retries(
+            &mut transaction,
+            rpc_client.clone(),
+            &program_client,
+            &source_keypair,
+        )
+        .await
+        {
+            println!(
+                "Failed to send transaction {}/{} ❌",
+                transaction_count,
+                (recipient_pubkeys.len() + MAX_TRANSFERS_PER_TX - 1) / MAX_TRANSFERS_PER_TX
+            );
+            println!("Writing remaining recipients to CSV 📝");
+            remaining_recipients.extend(
+                recipient_pubkeys
+                    .iter()
+                    .skip((transaction_count - 1) * MAX_TRANSFERS_PER_TX)
+                    .zip(
+                        recipient_amounts
+                            .iter()
+                            .skip((transaction_count - 1) * MAX_TRANSFERS_PER_TX),
+                    )
+                    .map(|(pk, &amt)| (pk.to_string(), amt)),
+            );
+            write_remaining_csv(remaining_recipients, REMAINING_CSV_FILE)?;
+            return Err(e);
+        }
     }
 
-    Ok(transactions)
+    Ok(())
 }
 
-async fn execute_airdrop(
-    transactions: Vec<Transaction>,
+async fn send_transaction_with_retries(
+    transaction: &mut Transaction,
+    rpc_client: Arc<RpcClient>,
+    program_client: &Arc<dyn ProgramClient<ProgramRpcClientSendTransaction>>,
+    source_keypair: &Arc<dyn Signer>,
+) -> Result<(), Box<dyn Error>> {
+    for attempt in 0..MAX_RETRIES {
+        println!(
+            "Sending transaction attempt {}/{} 🚀",
+            attempt + 1,
+            MAX_RETRIES
+        );
+        match send_transaction(transaction.clone(), rpc_client.clone()).await {
+            Ok(_) => return Ok(()),
+            Err(e) => {
+                if attempt + 1 == MAX_RETRIES {
+                    return Err(e);
+                }
+                if e.to_string().contains("Blockhash not found") {
+                    println!("Refreshing blockhash and retrying...");
+                    let blockhash = program_client.get_latest_blockhash().await.unwrap();
+                    transaction.message.recent_blockhash = blockhash;
+                    transaction.sign(&[source_keypair.as_ref()], blockhash);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn send_transaction(
+    transaction: Transaction,
     rpc_client: Arc<RpcClient>,
 ) -> Result<(), Box<dyn Error>> {
+    // println!("Sending transaction 🚀");
+
     let config = RpcSendTransactionConfig {
         skip_preflight: false,
         preflight_commitment: Some(CommitmentLevel::Processed),
         ..Default::default()
     };
 
-    // rpc_client.send_transaction(&transaction).await.unwrap();
+    let signature = rpc_client
+        .send_and_confirm_transaction_with_spinner_and_config(
+            &transaction,
+            CommitmentConfig::finalized(),
+            config,
+        )
+        .await
+        .map_err(|e| Box::new(e) as Box<dyn Error>)?;
 
-    for transaction in transactions.iter() {
-        println!("Sending tx 📦");
-        let signature = rpc_client
-            .send_and_confirm_transaction_with_spinner_and_config(
-                transaction,
-                CommitmentConfig::confirmed(),
-                config,
-            )
-            .await
-            .unwrap();
-        println!("Done ✅");
-        println!("Signature: {}", signature);
-    }
+    println!("Transaction sent successfully ✅");
+    println!("Signature: {}", signature);
 
     Ok(())
 }
@@ -285,10 +417,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     match args.command {
         Commands::Airdrop(args) => {
-            let tx = create_airdrop_tx(args, rpc_client.clone(), source_keypair)
-                .await
-                .unwrap();
-            execute_airdrop(tx, rpc_client.clone()).await?;
+            process_airdrop(&args, rpc_client.clone(), source_keypair).await?;
         }
     }
 
