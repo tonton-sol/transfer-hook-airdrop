@@ -224,7 +224,7 @@ async fn process_airdrop(
             &destination,
             &source_keypair.pubkey(),
             &[],
-            amount,
+            token_amount,
             9,
             fetch_account_data_fn,
         )
