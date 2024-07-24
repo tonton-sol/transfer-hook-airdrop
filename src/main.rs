@@ -24,7 +24,7 @@ use {
 
 const CU_LIMIT: u32 = 1000000;
 const REMAINING_CSV_FILE: &str = "remaining_recipients.csv";
-const MAX_RETRIES: usize = 1;
+const MAX_RETRIES: usize = 5;
 const MAX_TRANSFERS_PER_TX: usize = 4;
 
 #[derive(Parser)]
