@@ -24,7 +24,7 @@ use {
 
 const CU_LIMIT: u32 = 1000000;
 const REMAINING_CSV_FILE: &str = "remaining_recipients.csv";
-const MAX_RETRIES: usize = 3;
+const MAX_RETRIES: usize = 1;
 const MAX_TRANSFERS_PER_TX: usize = 4;
 
 #[derive(Parser)]
@@ -186,6 +186,9 @@ async fn process_airdrop(
     let mut transfer_count = 0;
     let mut remaining_recipients = vec![];
 
+    // Initialize remaining recipients file with headers
+    write_remaining_csv(vec![], REMAINING_CSV_FILE)?;
+
     for (_i, (recipient, &amount)) in recipient_pubkeys
         .iter()
         .zip(recipient_amounts.iter())
@@ -343,6 +346,12 @@ async fn process_airdrop(
             write_remaining_csv(remaining_recipients, REMAINING_CSV_FILE)?;
             return Err(e);
         }
+    }
+
+    // Write the final remaining recipients to the CSV file
+    if remaining_recipients.is_empty() {
+        println!("Airdrop successful 🎊");
+        write_remaining_csv(vec![], REMAINING_CSV_FILE)?;
     }
 
     Ok(())
